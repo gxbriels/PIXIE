@@ -94,6 +94,10 @@ sudo install minikube-linux-amd64 /usr/local/bin/minikube
 minikube start --driver=docker --cpus=2 --memory=4096
 ```
 > **Para que serve:** Inicializa o cluster Kubernetes local utilizando o Docker como motor e alocando **2 núcleos de CPU** e **4 GB de memória RAM** (requisitos mínimos recomendados para o Pixie rodar confortavelmente).
+>
+> Essa será a saída no terminal caso tenha dado tudo certo:
+
+![Instalação Minikube Concluída](./imgs/Passo4-Comando3.png)
 
 ---
 
@@ -106,6 +110,22 @@ Para enviar o Pixie para dentro do Kubernetes e visualizar os dados, utilizamos 
 > bash -c "$(curl -fsSL https://withpixie.ai/install.sh)"
 > ```
 > *(O executável padrão costuma ser salvo em `~/bin/px`)*.
+>
+> Saída Esperada:
+>
+> ![Primeira Confirmação](./imgs/Passo5-COmando1.png)
+>
+> Após isso, responder com "y".
+>
+> ![Segunda Confirmação](./imgs/Passo5-COmando2.png)
+>
+> Aperte enter e siga para os próximos passos.
+>
+> Saída esperada:
+>
+> ![Término](./imgs/Result-Passo5(1).png)
+>
+> 
 
 Caso o executável tenha sido baixado em `~/bin/px`:
 
@@ -118,11 +138,30 @@ mv ~/bin/px ~/bin/pixie
 ~/bin/pixie version
 ```
 > **Para que serve:** Exibe a versão instalada do CLI do Pixie, confirmando que o arquivo está funcionando.
+>
+> Saída esperada após os dois últimos comandos:
+> 
+> ![Confirmação Versão](./imgs/result-passo5.png)
 
 ```bash
 ~/bin/pixie auth login --manual
 ```
 > **Para que serve:** Inicia o processo de autenticação na plataforma do Pixie Cloud via navegador ou código manual, vinculando sua instalação à sua conta.
+>
+> Essa será a tela exibida:
+>
+> ![Começo do Login](./imgs/Passo5-Comando4.png)
+>
+> Após isso aperta "ctrl" + clique no link em que aparece no terminal para seguir para autenticar sua conta via web:
+>
+> ![Login PIXIE web](./imgs/AuthwebPixie.png)
+>
+> Faça o login e siga para a próxima página, copie e cole o token em seu terminal ativo:
+>
+> ![Tela Token PIXIE](./imgs/TOkenAuthWebPixie.png)
+>
+> ![Autenticação Concluída](./imgs/AutenticaçãoConcluida.png)
+> 
 
 ---
 
@@ -134,6 +173,16 @@ Agora que o Minikube está rodando e a ferramenta Pixie está autenticada, envia
 ~/bin/pixie deploy
 ```
 > **Para que serve:** Instala automaticamente os componentes do Pixie (coletores e agentes eBPF) dentro do cluster Kubernetes em execução.
+>
+> Após isso o terminal fará duas perguntas, se quer continuar com o deploy mesmo com imcompatibilidade e se o minikube é o cluster correto, responda com "y" para as duas.
+>
+> Próximas Telas:
+
+![Deploy pt1](./imgs/primeira-ultimamensagem.png)
+
+Aguarde e essa será a mensagem ao final do processo terminar:
+
+![Deploy pt2](./imgs/segunda-confirmacao.png)
 
 ---
 
@@ -147,6 +196,8 @@ minikube kubectl -- get pods -n pl -w
 > **Para que serve:**
 > - `get pods -n pl`: Lista os módulos (pods) em execução no namespace do Pixie (`pl`).
 > - `-w` (*watch*): Mantém o terminal aberto atualizando em tempo real até que todos os itens estejam com status `Running` (em execução).
+>
+> - Aperta "ctrl" + C para parar o terminal enquanto todos os processos estiverem como status "RUNNING".
 
 ---
 
@@ -154,6 +205,11 @@ minikube kubectl -- get pods -n pl -w
 
 Após todos os pods estarem ativos:
 
-1. Acesse o painel web no endereço indicado durante o comando de login: **[https://work.withpixie.ai](https://work.withpixie.ai)**.
-2. No painel, selecione o seu cluster do Minikube no menu superior.
+> Após a última tela aperta "ctrl" + Clique no segundo link fornecido pelo terminal, após isso será aberta uma página na web para que você possa acompanhar os dados do
+> seu cluster.
+>
+> ![Escolha Scripts PIXIE](./imgs/escolhas-scripts-pixie.png)
+
+1. No painel, selecione o seu cluster do Minikube no menu superior.
+2. Para esse primeiro exemplo desse cluster recomenda-se começar as análises através do script "px/nodes" e ir explorando a ferramenta através de outros clusters e scripts.
 3. Você terá acesso aos scripts integrados do Pixie para inspecionar requisições HTTP, uso de tráfego de rede e consumo de recursos sem precisar configurar nada a mais!
