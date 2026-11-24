@@ -1,0 +1,128 @@
+# =============================================================================
+# dashboard_falhas.pxl — Painel de falhas da Online Boutique
+#
+# Ajustado às limitações observadas no ambiente (minikube kvm2 + Pixie):
+#   - http_events decodifica apenas o HTTP/1.1 do frontend (gRPC interno não)
+#   - process_stats vem vazia
+# Por isso: L7 é analisado POR ROTA do frontend e o tráfego interno (gRPC)
+# é medido na camada L4 via conn_stats, que não depende de decodificar o protocolo.
+#
+# Terminal:  px live -f scripts/dashboard_falhas.pxl  |  px run -f scripts/dashboard_falhas.pxl
+# Web:       Scratch Pad -> colar -> RUN
+# =============================================================================
+import px
+
+NAMESPACE = 'boutique'
+JANELA = '-5m'
+JANELA_S = 300.0
+
+
+def normaliza_svc(col):
+    # o pod do frontend pertence a 2 Services (frontend e frontend-external)
+    return px.select(px.contains(col, 'frontend'), 'boutique/frontend', col)
+
+
+# ------------------------------------------------------------- L7 (frontend)
+def http_base():
+    df = px.DataFrame(table='http_events', start_time=JANELA)
+    df = df[df.trace_role == 2]
+    df.namespace = df.ctx['namespace']
+    df = df[df.namespace == NAMESPACE]
+    df = df[px.contains(df.req_path, '_healthz') == False]
+    # agrupa /product/<ID> numa rota só
+    df.rota = px.select(px.contains(df.req_path, '/product/'), '/product/*', df.req_path)
+    df.rota = df.req_method + ' ' + df.rota
+    df.erro = px.select(df.resp_status >= 400, 1, 0)
+    df.latency_ms = df.latency / 1000000.0
+    return df
+
+
+def ranking_rotas(df):
+    agg = df.groupby('rota').agg(
+        requisicoes=('latency', px.count),
+        erros=('erro', px.sum),
+        lat_q=('latency', px.quantiles),
+    )
+    agg.rps = agg.requisicoes / JANELA_S
+    agg.taxa_erro_pct = 100.0 * agg.erros / agg.requisicoes
+    agg.p50_ms = px.pluck_float64(agg.lat_q, 'p50') / 1000000.0
+    agg.p90_ms = px.pluck_float64(agg.lat_q, 'p90') / 1000000.0
+    agg.p99_ms = px.pluck_float64(agg.lat_q, 'p99') / 1000000.0
+    # score heurístico: 2 x erro% + p99/10  (justificar os pesos no relatório)
+    agg.score_risco = agg.taxa_erro_pct * 2.0 + agg.p99_ms / 10.0
+    return agg[['rota', 'score_risco', 'requisicoes', 'rps', 'erros',
+                'taxa_erro_pct', 'p50_ms', 'p90_ms', 'p99_ms']]
+
+
+def serie_temporal(df):
+    df.timestamp = px.bin(df.time_, px.DurationNanos(10 * 1000 * 1000 * 1000))
+    ts = df.groupby(['timestamp', 'rota']).agg(
+        requisicoes=('latency', px.count),
+        erros=('erro', px.sum),
+        lat_q=('latency', px.quantiles),
+    )
+    ts.taxa_erro_pct = 100.0 * ts.erros / ts.requisicoes
+    ts.p99_ms = px.pluck_float64(ts.lat_q, 'p99') / 1000000.0
+    return ts[['timestamp', 'rota', 'requisicoes', 'erros', 'taxa_erro_pct', 'p99_ms']]
+
+
+def ultimos_erros(df):
+    e = df[df.erro == 1]
+    return e[['time_', 'rota', 'req_path', 'resp_status', 'resp_message', 'latency_ms']].head(200)
+
+
+# ------------------------------------------------------------- L4 serviço -> serviço
+def fluxo_servicos():
+    df = px.DataFrame(table='conn_stats', start_time=JANELA)
+    df = df[df.trace_role == 2]                     # lado servidor: remote_addr = IP real do cliente
+    df.namespace = df.ctx['namespace']
+    df = df[df.namespace == NAMESPACE]
+    df.destino = normaliza_svc(df.ctx['service'])
+    df.origem = normaliza_svc(px.pod_id_to_service_name(px.ip_to_pod_id(df.remote_addr)))
+    df = df[df.origem != '']                        # descarta probes do kubelet / IPs externos
+    # contadores cumulativos por conexão -> delta na janela = max - min
+    c = df.groupby(['origem', 'destino', 'upid', 'remote_addr', 'remote_port']).agg(
+        env_max=('bytes_sent', px.max), env_min=('bytes_sent', px.min),
+        rec_max=('bytes_recv', px.max), rec_min=('bytes_recv', px.min),
+        ab_max=('conn_open', px.max), ab_min=('conn_open', px.min),
+    )
+    c.resp_bytes = c.env_max - c.env_min           # destino -> origem (respostas)
+    c.req_bytes = c.rec_max - c.rec_min            # origem -> destino (requisições)
+    c.conexoes_novas = c.ab_max - c.ab_min
+    f = c.groupby(['origem', 'destino']).agg(
+        req_bytes=('req_bytes', px.sum),
+        resp_bytes=('resp_bytes', px.sum),
+        conexoes_novas=('conexoes_novas', px.sum),
+    )
+    # bytes/s (e não KB/s): pares de pouco tráfego, como checkout -> payment,
+    # apareceriam como 0,00 KB/s
+    f.req_bytes_s = f.req_bytes / JANELA_S
+    f.resp_bytes_s = f.resp_bytes / JANELA_S
+    return f[['origem', 'destino', 'req_bytes_s', 'resp_bytes_s', 'conexoes_novas']]
+
+
+def rede_pods():
+    df = px.DataFrame(table='network_stats', start_time=JANELA)
+    df.namespace = df.ctx['namespace']
+    df = df[df.namespace == NAMESPACE]
+    df.pod = df.ctx['pod']
+    a = df.groupby('pod').agg(
+        rx_b_max=('rx_bytes', px.max), rx_b_min=('rx_bytes', px.min),
+        tx_b_max=('tx_bytes', px.max), tx_b_min=('tx_bytes', px.min),
+        rx_d_max=('rx_drops', px.max), rx_d_min=('rx_drops', px.min),
+        tx_d_max=('tx_drops', px.max), tx_d_min=('tx_drops', px.min),
+        rx_e_max=('rx_errors', px.max), rx_e_min=('rx_errors', px.min),
+        tx_e_max=('tx_errors', px.max), tx_e_min=('tx_errors', px.min),
+    )
+    a.rx_mb = (a.rx_b_max - a.rx_b_min) / (1024.0 * 1024.0)
+    a.tx_mb = (a.tx_b_max - a.tx_b_min) / (1024.0 * 1024.0)
+    a.descartes = (a.rx_d_max - a.rx_d_min) + (a.tx_d_max - a.tx_d_min)
+    a.erros = (a.rx_e_max - a.rx_e_min) + (a.tx_e_max - a.tx_e_min)
+    return a[['pod', 'rx_mb', 'tx_mb', 'descartes', 'erros']]
+
+
+px.display(ranking_rotas(http_base()), 'Ranking_Rotas_Frontend')
+px.display(serie_temporal(http_base()), 'Serie_Temporal_10s')
+px.display(ultimos_erros(http_base()), 'Ultimos_Erros')
+px.display(fluxo_servicos(), 'Fluxo_L4_Servicos')
+px.display(rede_pods(), 'Rede_L4_Pods')

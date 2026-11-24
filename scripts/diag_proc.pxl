@@ -1,0 +1,6 @@
+# diag_proc.pxl — Diagnóstico: a tabela process_stats (CPU/memória por processo) tem dados?
+import px
+df = px.DataFrame(table='process_stats', start_time='-1m')
+df.ns = df.ctx['namespace']
+df.pod = df.ctx['pod']
+px.display(df[['time_', 'ns', 'pod', 'cpu_utime_ns', 'rss_bytes']].head(10), 'diag_proc')

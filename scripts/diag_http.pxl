@@ -1,0 +1,10 @@
+# diag_http.pxl — Diagnóstico: quais serviços/pods o Pixie decodifica em http_events
+# trace_role: 1 = cliente, 2 = servidor | major_version: 1 = HTTP/1.x, 2 = HTTP/2 (gRPC)
+import px
+df = px.DataFrame(table='http_events', start_time='-5m')
+df.namespace = df.ctx['namespace']
+df = df[df.namespace == 'boutique']
+df.service = df.ctx['service']
+df.pod = df.ctx['pod']
+agg = df.groupby(['service', 'pod', 'trace_role', 'major_version']).agg(n=('latency', px.count))
+px.display(agg, 'diag_http')

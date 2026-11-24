@@ -395,6 +395,26 @@ Escolha abaixo a subseção correspondente à sua distribuição Linux (**2A par
    deployment.apps/loadgenerator created
    ```
 
+   > **Recomendado (replicabilidade):** o arquivo acima aponta para o branch `main`, que muda a cada release da Google. Para que todas as turmas usem exatamente a mesma versão, salve uma cópia local dentro da pasta `scripts/` do repositório e aplique a partir dela. O script `falhas.sh` (Passo 10) usa essa cópia automaticamente quando ela existe:
+   > ```bash
+   > curl -L -o scripts/kubernetes-manifests.yaml \
+   >   https://raw.githubusercontent.com/GoogleCloudPlatform/microservices-demo/main/release/kubernetes-manifests.yaml
+   > kubectl apply -n boutique -f scripts/kubernetes-manifests.yaml
+   > ```
+
+2.1. **Obrigatório em VMs de 4 GB:** reduza as reservas (*requests*) de CPU e memória dos microsserviços. Os manifestos oficiais reservam mais memória do que sobra na VM depois do Pixie: sem este passo o nó chega a ~95% de memória reservada e alguns pods ficam presos em `Pending` com `Insufficient memory`, em geral o **`loadgenerator`**. Sem ele **não existe tráfego na loja** e todas as tabelas de latência do Pixie ficam vazias, sem nenhum aviso de erro. O comando altera só a reserva usada no agendamento; os limites (*limits*) continuam os originais.
+   ```bash
+   kubectl set resources deployment --all -n boutique --requests=cpu=20m,memory=32Mi
+   ```
+   **Retorno esperado:**
+   ```text
+   deployment.apps/adservice resource requirements updated
+   deployment.apps/cartservice resource requirements updated
+   ...
+   deployment.apps/shippingservice resource requirements updated
+   ```
+   Para conferir a ocupação do nó: `kubectl describe node pixie-cluster | grep -A6 "Allocated resources"`.
+
 3. Acompanhe a inicialização dos microsserviços até atingirem `1/1 Running`:
    ```bash
    kubectl get pods -n boutique
@@ -414,6 +434,19 @@ Escolha abaixo a subseção correspondente à sua distribuição Linux (**2A par
    recommendationservice-574c444bdd-dx8rf   1/1     Running   0          2m
    redis-cart-67c6cc55cb-g4skp              1/1     Running   0          2m
    shippingservice-d9fd7754b-2hlhc          1/1     Running   0          2m
+   ```
+
+3.1. Confirme que o gerador de tráfego sintético (Locust) está de fato enviando requisições. Sem ele, os experimentos de falha não produzem dados:
+   ```bash
+   kubectl logs -n boutique deploy/loadgenerator --tail=15
+   ```
+   **Retorno esperado** (a contagem `# reqs` deve crescer a cada atualização):
+   ```text
+   Type     Name                       # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+   GET      /                              10     0(0.00%) |     40      20      90     35 |    1.00        0.00
+   GET      /product/66VCHSJNUP             2     0(0.00%) |     36      33      40     35 |    0.20        0.00
+   ...
+            Aggregated                     24     0(0.00%) |     38      18     110     35 |    2.10        0.00
    ```
 
 4. Exponha o serviço `frontend-external` localmente para acessar a loja pelo navegador e disparar transações manuais (`POST /cart` e `POST /cart/checkout`):
@@ -598,6 +631,24 @@ sudo iptables -I FORWARD 1 -i virbr0 -j ACCEPT
 sudo iptables -I FORWARD 1 -o virbr0 -j ACCEPT
 ```
 
+> **Se o laboratório ficou muitos dias desligado** (testado após ~3 semanas parado), execute a sequência completa abaixo antes de qualquer outra coisa. No Arch Linux, os sockets do Libvirt e a rede `default` podem não subir sozinhos:
+> ```bash
+> sudo systemctl start virtqemud.socket virtnetworkd.socket virtstoraged.socket virtlogd.socket   # Arch
+> sudo systemctl start libvirtd                                                                   # Ubuntu/Debian
+> export LIBVIRT_DEFAULT_URI="qemu:///system"
+> virsh list --all                  # a VM "pixie-cluster" deve aparecer como "shut off"
+> sudo virsh net-start default      # "already active" também é um resultado válido
+> sudo sysctl -w net.ipv4.ip_forward=1
+> sudo iptables -P FORWARD ACCEPT
+> sudo iptables -I FORWARD 1 -i virbr0 -j ACCEPT
+> sudo iptables -I FORWARD 1 -o virbr0 -j ACCEPT
+> minikube start -p pixie-cluster
+> kubectl config use-context pixie-cluster
+> kubectl get pods -A               # aguarde todos em Running (3 a 5 min)
+> px get viz                        # o cluster deve estar CS_HEALTHY
+> kubectl get pods -n boutique      # confira se há pods Pending (ver 9.3)
+> ```
+
 ### 9.3. Solução Rápida de Problemas (Troubleshooting)
 
 * **Erro `Unable to connect to the server: dial tcp 192.168.39.x:8443: connect: no route to host`:**
@@ -618,3 +669,191 @@ sudo iptables -I FORWARD 1 -o virbr0 -j ACCEPT
   kubectl delete pods -n boutique --field-selector status.phase=Failed --force --grace-period=0
   kubectl delete pods -n boutique --field-selector status.phase=Unknown --force --grace-period=0
   ```
+* **Pods em `Pending` com `Insufficient memory` (`kubectl describe pod <nome> -n boutique` → seção *Events*):**
+  A memória reservada no nó se esgotou. Reduza os *requests* (Passo 6, item 2.1) e apague os pods `Pending` que sobrarem de rollouts antigos:
+  ```bash
+  kubectl set resources deployment --all -n boutique --requests=cpu=20m,memory=32Mi
+  kubectl delete pod -n boutique <nome-do-pod-pending>
+  ```
+  Se a máquina física tiver **16 GB ou mais**, a solução definitiva é aumentar a VM para 8 GB:
+  ```bash
+  minikube stop -p pixie-cluster
+  sudo virsh setmaxmem pixie-cluster 8388608 --config
+  sudo virsh setmem    pixie-cluster 8388608 --config
+  sed -i 's/"Memory": *[0-9]*/"Memory": 8192/' ~/.minikube/profiles/pixie-cluster/config.json
+  minikube start -p pixie-cluster
+  ```
+* **Pares de pods (um `Running` antigo + um `Pending` novo) após `kubectl rollout restart`:**
+  O Kubernetes só encerra o pod antigo depois que o novo fica pronto. Numa VM sem memória livre o novo nunca é agendado e o rollout fica travado. Aplique a correção acima. **Evite `kubectl rollout restart deployment -n boutique` (todos de uma vez)**: em VM de 4 GB isso deixa a loja indisponível por vários minutos.
+* **Tabelas de latência do Pixie vazias, só com health checks (`/_healthz`):**
+  Não há tráfego na loja. Verifique se o `loadgenerator` está `Running` e se o log dele mostra requisições (Passo 6, item 3.1).
+* **Todas as rotas retornando `500` com latência de ~5 s:**
+  Sintoma de falha em cascata do `redis-cart` (o carrinho é consultado por todas as páginas). Confira com `kubectl get pods -n boutique | grep redis` e, se necessário, `kubectl scale deployment/redis-cart -n boutique --replicas=1`.
+* **`error: Metrics API not available` no `kubectl top`:**
+  O metrics-server leva 1 a 2 minutos para subir depois de habilitado. Confira com `kubectl get pods -n kube-system | grep metrics`. Se ficar `Pending`, é falta de memória (ver acima).
+* **`RTNETLINK answers: Operation not permitted` ao injetar latência/perda de rede:**
+  O container de debug herdou o usuário não-root do pod. Use a versão do `scripts/falhas.sh` deste repositório, que cria o container efêmero com perfil customizado (`runAsUser: 0` + `NET_ADMIN`). A saída correta precisa conter `TC_OK` e `qdisc netem`.
+
+---
+
+## Passo 10: Injeção Controlada de Falhas (Fault Injection)
+
+Este passo provoca falhas intencionais na Online Boutique **sem alterar o código-fonte**, atuando no Kubernetes, na rede dos pods e no nó, e usa o Pixie para observar como cada falha se propaga entre os microsserviços.
+
+### 10.1. Arquivos utilizados (pasta `scripts/`)
+
+| Arquivo | Função |
+|---|---|
+| `scripts/falhas.sh` | Injeta e desfaz as falhas. Registra cada ação com data, hora e fuso em `resultados/experimentos.csv` |
+| `scripts/dashboard_falhas.pxl` | Painel PxL com o resumo das falhas (Passo 11) |
+| `scripts/diag_http.pxl` / `scripts/diag_proc.pxl` | Diagnósticos de quais dados o Pixie está coletando (Passo 12) |
+| `scripts/kubernetes-manifests.yaml` | Cópia local opcional do manifesto da Boutique (Passo 6, item 2) |
+
+As ferramentas de falha rodam **dentro do cluster** (imagens `nicolaka/netshoot` com `tc`/netem e `alexeiled/stress-ng`). Não é preciso instalar nada a mais no host, seja Ubuntu ou Arch.
+
+### 10.2. Preparação (uma vez por sessão)
+
+1. Torne o script executável e veja os comandos disponíveis:
+   ```bash
+   chmod +x scripts/falhas.sh
+   ./scripts/falhas.sh ajuda
+   ```
+2. Garanta os *requests* reduzidos (ver Passo 6, item 2.1):
+   ```bash
+   ./scripts/falhas.sh recursos
+   ```
+3. Baixe antecipadamente as imagens das ferramentas dentro da VM, para não esperar no meio de um experimento:
+   ```bash
+   minikube ssh -p pixie-cluster -- "docker pull nicolaka/netshoot && docker pull alexeiled/stress-ng"
+   ```
+4. Verifique se o kernel da VM possui o módulo `netem` (necessário para as falhas de rede):
+   ```bash
+   minikube ssh -p pixie-cluster -- "sudo modprobe sch_netem && lsmod | grep netem"
+   ```
+   **Retorno esperado:** uma linha contendo `sch_netem`.
+5. Habilite o metrics-server para medir CPU e memória por pod. Ele substitui a tabela `process_stats` do Pixie, que não funcionou neste ambiente (ver Passo 12):
+   ```bash
+   minikube addons enable metrics-server -p pixie-cluster
+   kubectl top pods -n boutique      # aguarde 1 a 2 min após habilitar
+   ```
+   **Retorno esperado:**
+   ```text
+   NAME                                     CPU(cores)   MEMORY(bytes)
+   adservice-54c9f8bdcf-jltnp               2m           92Mi
+   cartservice-6b67d48744-g4jp9             7m           71Mi
+   ...
+   ```
+   > O metrics-server também reserva memória. Em VM de 4 GB, se outro pod ficar `Pending` depois de habilitá-lo, desabilite-o durante os experimentos: `minikube addons disable metrics-server -p pixie-cluster`.
+
+### 10.3. Protocolo experimental (siga para cada cenário)
+
+Injete **uma falha por vez**. O painel analisa sempre os últimos 5 minutos, então cada captura deve cobrir exatamente uma fase:
+
+```bash
+mkdir -p resultados
+./scripts/falhas.sh marco baseline
+sleep 300; px run -f scripts/dashboard_falhas.pxl -o json > resultados/cN_baseline.json
+
+./scripts/falhas.sh <comando-da-falha> <args>
+sleep 300; px run -f scripts/dashboard_falhas.pxl -o json > resultados/cN_falha.json
+
+./scripts/falhas.sh <comando-que-desfaz>        # ver tabela abaixo
+./scripts/falhas.sh marco recuperacao
+sleep 300; px run -f scripts/dashboard_falhas.pxl -o json > resultados/cN_recuperacao.json
+```
+Em cada fase, salve também `kubectl top pods -n boutique > resultados/cN_<fase>_top.txt` e prints do painel na interface web. Não injete duas falhas sobrepostas: isso torna impossível atribuir cada efeito à sua causa.
+
+### 10.4. Catálogo de cenários
+
+| # | Cenário | Injetar | Desfazer | Onde atua | Sinal esperado no Pixie |
+|---|---|---|---|---|---|
+| 1 | Latência na aplicação | `./scripts/falhas.sh catalogo-lento 500ms` | `./scripts/falhas.sh reset` | Variável `EXTRA_LATENCY` (recurso nativo da Boutique) | p99 de `GET /` e `GET /product/*` sobe; vazão cai; **nenhum erro** |
+| 2 | Latência de rede | `./scripts/falhas.sh latencia currencyservice 300ms 50ms` | `./scripts/falhas.sh rede-reset currencyservice` | `tc netem` na `eth0` do pod (container efêmero) | p99 de quase todas as rotas sobe (a conversão de moeda está em todas as páginas) |
+| 3 | Perda de pacotes | `./scripts/falhas.sh perda cartservice 20%` | `./scripts/falhas.sh rede-reset cartservice` | `tc netem` | Picos irregulares de latência (retransmissões TCP) |
+| 4 | Serviço indisponível | `./scripts/falhas.sh derrubar paymentservice` | `./scripts/falhas.sh restaurar paymentservice` | Réplicas = 0 | `POST /cart/checkout` com **500**; o par checkoutservice → paymentservice some do fluxo L4 |
+| 5 | Falha em cascata | `./scripts/falhas.sh derrubar redis-cart` | `./scripts/falhas.sh restaurar redis-cart` | Réplicas = 0 | **Todas** as rotas com 500 e latência de ~5 s (timeout) |
+| 6 | Stress de CPU (vizinho barulhento) | `./scripts/falhas.sh cpu-stress 4 300` | termina sozinho em 300 s, ou `./scripts/falhas.sh reset` | Pod `stress-ng` no nó | Latência sobe em todas as rotas; ver `kubectl top` |
+| 7 | Throttling de CPU | `./scripts/falhas.sh cpu-limite currencyservice 20` | `./scripts/falhas.sh reset currencyservice` | Limite de 20 millicores | Degradação concentrada nas rotas que usam o serviço |
+| 8 | Falta de memória | `./scripts/falhas.sh mem-limite currencyservice 32` | `./scripts/falhas.sh reset currencyservice` | Limite de 32 Mi | `OOMKilled` / reinícios; erros intermitentes |
+| 9 | Alta demanda | `./scripts/falhas.sh carga 150 15 2` | `./scripts/falhas.sh reset` | Usuários do Locust e réplicas do loadgenerator | RPS e p99 sobem; combine com o cenário 7 para mostrar saturação |
+| 10 | Chaos monkey | `./scripts/falhas.sh matar-pods cartservice 5 30` | termina sozinho | Apaga o pod a cada 30 s | Rajadas de erro a cada reinício |
+
+> **Cuidados:** a VM tem pouca memória. No `mem-stress`, não passe de ~1024 MB, senão o OOM-Killer derruba a VM inteira (erro `no route to host`, ver 9.3). O stress de CPU também atinge o próprio PEM do Pixie, o que é um ponto a discutir na análise.
+>
+> **Status dos testes (24/11/2026):** os cenários 1 e 5 foram executados com sucesso e o painel registrou os efeitos (ver 10.5). Os cenários de rede (2 e 3) dependem da correção de permissão do `tc` descrita em 9.3 e ainda precisam ser validados. Os demais seguem o mesmo mecanismo do Kubernetes dos cenários testados.
+
+### 10.5. Resultados de referência
+
+Use estes números para conferir se o seu ambiente se comporta de forma parecida.
+
+**Cenário 1, `EXTRA_LATENCY=500ms` no productcatalogservice** (rota agregada do frontend, intervalos de 10 s, 10 usuários do Locust):
+
+| Fase | p99 típico | Requisições a cada 10 s | Erros | TX do frontend em 5 min |
+|---|---|---|---|---|
+| Baseline | ~41 ms | ~26 | ~0 | 9,0 MB |
+| Falha | ~4.500 ms | ~15 | 0 | 5,5 MB |
+| Recuperação | ~38 ms | ~27 | 0 | 9,2 MB |
+
+Leitura do resultado:
+* **Amplificação:** 500 ms injetados num único serviço viraram ~4,5 s para o usuário, porque cada página chama o catálogo várias vezes em sequência.
+* **Queda de vazão confirmada em duas camadas:** na L7 (menos requisições) e na L4 (menos bytes transmitidos).
+* **Degradação silenciosa:** taxa de erro zero e probes saudáveis durante toda a falha. Só a medição de latência por eBPF revelou o problema.
+
+**Cenário 5, queda do `redis-cart`:** todas as rotas (`GET /`, `GET /product/*`, `GET /cart`, `POST /cart`, `POST /cart/checkout`) retornaram `500 Internal Server Error` com latência entre 5 e 6 s (timeout). O pod sumiu das tabelas L4, enquanto os demais continuavam `Running` no Kubernetes.
+
+---
+
+## Passo 11: Painel de Falhas em PxL (`scripts/dashboard_falhas.pxl`)
+
+1. Execute pelo terminal, de uma vez ou em modo contínuo:
+   ```bash
+   px run  -f scripts/dashboard_falhas.pxl
+   px live -f scripts/dashboard_falhas.pxl      # atualiza sozinho
+   ```
+   Na web (**work.getcosmic.ai**), selecione o cluster, escolha **Scratch Pad**, cole o conteúdo do arquivo e clique em **RUN**.
+
+2. Tabelas geradas:
+
+| Tabela | Conteúdo | Uso na análise |
+|---|---|---|
+| `Ranking_Rotas_Frontend` | Requisições, RPS, erros, p50/p90/p99 e `score_risco` por rota (`/product/<id>` agrupado como `/product/*`) | Cada rota depende de um conjunto de serviços. A rota mais degradada aponta onde está a falha. Em operação normal, `POST /cart/checkout` lidera o ranking por ser a rota que atravessa mais serviços |
+| `Serie_Temporal_10s` | p99 e taxa de erro por rota a cada 10 s | Curva de baseline → falha → recuperação |
+| `Ultimos_Erros` | Requisições com HTTP ≥ 400, com caminho, status e mensagem | Identificar quais rotas falharam e quando |
+| `Fluxo_L4_Servicos` | Bytes/s de requisição e de resposta por par origem → destino (tabela `conn_stats`) | Mostra o tráfego **gRPC interno** mesmo sem decodificá-lo (ver Passo 12) |
+| `Rede_L4_Pods` | MB recebidos/enviados, descartes e erros de interface por pod na janela | Vazão por pod; pods ausentes indicam indisponibilidade |
+
+   `score_risco = 2 × taxa_de_erro(%) + p99(ms) / 10`. É uma heurística definida pelo grupo, e os pesos devem ser justificados no relatório.
+
+3. **Retorno esperado** (`Ranking_Rotas_Frontend`, operação normal):
+   ```text
+   ROTA                 SCORE_RISCO  REQUISICOES  RPS   ERROS  TAXA_ERRO_PCT  P50_MS  P90_MS  P99_MS
+   POST /cart/checkout  41.11        35           0.12  0      0              31.02   39.64   411.1
+   GET /                20.69        77           0.26  0      0              24.15   40.68   206.9
+   GET /product/*       12.59        375          1.25  0      0              20.70   40.68   125.9
+   GET /cart            7.74         177          0.59  0      0              16.42   37.18   77.4
+   POST /cart           0.87         85           0.28  0      0              2.41    3.97    8.7
+   POST /setCurrency    0.85         58           0.19  0      0              2.87    6.26    8.5
+   ```
+
+---
+
+## Passo 12: Limitações Observadas e Diagnóstico da Coleta
+
+Durante os experimentos, foram identificadas limitações do Pixie neste ambiente (Minikube kvm2 + VM de 4 GB). Elas não invalidam a análise, mas definiram o desenho do painel e devem ser citadas no relatório.
+
+1. **O gRPC (HTTP/2) entre os microsserviços não é decodificado.** A tabela `http_events` contém apenas o HTTP/1.1 do `frontend`. Para confirmar:
+   ```bash
+   px run -f scripts/diag_http.pxl
+   kubectl logs -n pl -l name=vizier-pem --tail=500 | grep "ConnTracker statistics" | tail -1
+   ```
+   **Retorno observado:** `diag_http` com uma única linha (`boutique/frontend`, `trace_role=2`, `major_version=1`), e nos logs do PEM algo como `kProtocolHTTP2=4 ... kProtocolUnknown=385`. Quase todas as conexões gRPC são classificadas como protocolo desconhecido. A causa provável é a compressão de cabeçalhos do HTTP/2 (HPACK) em conexões de longa duração. **Contorno:** o tráfego interno é medido na camada L4 pela tabela `conn_stats` (`Fluxo_L4_Servicos`), que não depende de decodificar o protocolo.
+
+2. **A tabela `process_stats` (CPU/memória por processo) fica vazia.**
+   ```bash
+   px run -f scripts/diag_proc.pxl
+   ```
+   **Retorno observado:** tabela sem linhas. **Contorno:** CPU e memória por pod via `kubectl top pods -n boutique` (metrics-server, Passo 10.2).
+
+3. **Perda de eventos sob carga.** Os logs do PEM registraram `kLossMMapEvent=13636`: eventos descartados do buffer entre kernel e espaço de usuário. A captura por eBPF não é 100% sem perdas numa VM com poucos recursos, então em cenários de carga alta as contagens absolutas são uma estimativa por baixo.
+
+4. **Permissões para injetar falhas de rede.** Os pods da Boutique rodam como não-root. Injetar `tc netem` exige um container efêmero com `runAsUser: 0` e `NET_ADMIN` (já tratado em `scripts/falhas.sh`).
